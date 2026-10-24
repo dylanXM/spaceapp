@@ -23,11 +23,12 @@
  * the dev-login shortcut is never enabled.
  */
 import { spawn, execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync,
   rmSync, symlinkSync, writeFileSync, watch
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -43,6 +44,61 @@ const CLI_WRAPPER_NAMES = [
   "codex", "claude", "gemini", "opencode", "qwen", "kimi",
   "grok", "deepseek", "autohand", "cursor", "copilot"
 ];
+
+/**
+ * Ownership marker written into every state directory `up` creates. reset
+ * deletes the whole state directory, so it first proves the directory is
+ * really ours by checking for this file (see assertResetAllowed).
+ */
+export const STATE_MARKER_FILE = ".dev-stack-owned";
+export const STATE_MARKER_CONTENTS = "spaceapp dev-stack state directory\n";
+
+/**
+ * Derive the compose project name from the state directory's absolute path:
+ * stable for a given state directory, different across checkouts, so two
+ * checkouts on one machine never share containers or volumes.
+ */
+export function composeProjectName(stateDir) {
+  const suffix = createHash("sha256").update(resolve(stateDir)).digest("hex").slice(0, 8);
+  return `spaceapp-dev-${suffix}`;
+}
+
+/** Stamp the state directory as dev-stack-owned (called during `up` setup). */
+export function ensureStateMarker(config) {
+  mkdirSync(config.stateDir, { recursive: true });
+  writeFileSync(join(config.stateDir, STATE_MARKER_FILE), STATE_MARKER_CONTENTS);
+}
+
+/**
+ * Guard for commandReset, which recursively deletes the state directory.
+ * Refuses when the state directory resolves to the repository root, the
+ * user's home directory or the filesystem root, and when the directory
+ * does not carry the ownership marker written by `up`.
+ */
+export function assertResetAllowed(config) {
+  const { stateDir } = config;
+  const forbidden = new Map([
+    [resolve(repoRoot), "the repository root"],
+    [resolve(homedir()), "your home directory"],
+    [resolve("/"), "the filesystem root"]
+  ]);
+  if (forbidden.has(stateDir)) {
+    throw new Error(
+      `Refusing to reset: the dev-stack state directory resolves to ${forbidden.get(stateDir)} (${stateDir}). ` +
+      "Point SPACE_DEV_STATE_DIR at a dedicated directory instead."
+    );
+  }
+  let marker = null;
+  try {
+    marker = readFileSync(join(stateDir, STATE_MARKER_FILE), "utf8");
+  } catch { /* missing marker */ }
+  if (marker !== STATE_MARKER_CONTENTS) {
+    throw new Error(
+      `Refusing to delete ${stateDir}: it does not carry the dev-stack ownership marker (${STATE_MARKER_FILE}), ` +
+      "so it may not belong to dev:stack. If you are sure it is disposable, remove it manually."
+    );
+  }
+}
 
 /** Resolve ports and directories. Defaults never collide with an install (4910/4911). */
 export function buildConfig(env = process.env) {
@@ -68,7 +124,7 @@ export function buildConfig(env = process.env) {
     workspacesDir: join(stateDir, "workspaces"),
     composeFile: join(stateDir, "compose.yml"),
     pidsFile: join(stateDir, "pids.json"),
-    composeProject: "spaceapp-dev",
+    composeProject: composeProjectName(stateDir),
     apiPort: port("SPACE_DEV_API_PORT", 14910),
     webPort: port("SPACE_DEV_WEB_PORT", 14911),
     postgresPort: port("SPACE_DEV_POSTGRES_PORT", 15432),
@@ -298,6 +354,7 @@ async function commandReset(config) {
   if (existsSync(config.composeFile)) {
     await dockerCompose(config, ["down", "-v", "--remove-orphans"], { allowFailure: true, stdio: "inherit" });
   }
+  assertResetAllowed(config);
   if (existsSync(config.stateDir)) rmSync(config.stateDir, { recursive: true, force: true });
   log("Dev stack removed: containers, volumes and .dev-stack state are gone.");
 }
@@ -435,6 +492,7 @@ async function commandUp(config) {
   await run("docker", ["compose", "version"], { stdio: "pipe" })
     .catch(() => { throw new Error("Docker Compose v2 is required (docker compose version failed)."); });
 
+  ensureStateMarker(config);
   mkdirSync(config.logsDir, { recursive: true });
   mkdirSync(join(config.stateDir, "run"), { recursive: true });
   mkdirSync(config.workspacesDir, { recursive: true });

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
-  buildConfig, ensureSecrets, parseOpencodePin, parseServiceImage, renderCompose, repoRoot
+  assertResetAllowed, buildConfig, composeProjectName, ensureSecrets, ensureStateMarker,
+  parseOpencodePin, parseServiceImage, renderCompose, repoRoot
 } from "../dev-stack.mjs";
 
 const templateCompose = readFileSync(
@@ -73,6 +74,44 @@ test("rendered compose uses the parsed images and binds ports to 127.0.0.1 only"
   assert.match(rendered, new RegExp(`127\\.0\\.0\\.1:${config.temporalPort}:7233`));
   assert.doesNotMatch(rendered, /__[A-Z_]+__/);
   assert.doesNotMatch(rendered, /0\.0\.0\.0:/);
+});
+
+test("compose project name is derived from the state directory: stable, unique, valid", () => {
+  const a1 = buildConfig({ SPACE_DEV_STATE_DIR: join(tmpdir(), "dev-stack-a") });
+  const a2 = buildConfig({ SPACE_DEV_STATE_DIR: join(tmpdir(), "dev-stack-a") });
+  const b = buildConfig({ SPACE_DEV_STATE_DIR: join(tmpdir(), "dev-stack-b") });
+  assert.equal(a1.composeProject, a2.composeProject, "same state dir -> same project name");
+  assert.notEqual(a1.composeProject, b.composeProject, "different state dirs -> different project names");
+  assert.match(a1.composeProject, /^spaceapp-dev-[0-9a-f]{8}$/, "lowercase, digits and hyphens only");
+  assert.equal(composeProjectName(a1.stateDir), a1.composeProject);
+  assert.notEqual(buildConfig({}).composeProject, "spaceapp-dev", "no longer the shared hardcoded name");
+});
+
+test("reset guard refuses a state directory without the ownership marker", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "dev-stack-test-"));
+  const config = buildConfig({ SPACE_DEV_STATE_DIR: stateDir });
+  assert.throws(() => assertResetAllowed(config), /ownership marker/);
+  ensureStateMarker(config);
+  assert.doesNotThrow(() => assertResetAllowed(config));
+});
+
+test("reset guard refuses repo root, home directory and filesystem root", () => {
+  for (const dangerous of [repoRoot, homedir(), resolve("/")]) {
+    const config = buildConfig({ SPACE_DEV_STATE_DIR: dangerous });
+    assert.throws(() => assertResetAllowed(config), /Refusing to reset/);
+  }
+});
+
+test("default temporal port stays 7233: the install template never publishes it on the host", () => {
+  const config = buildConfig({});
+  assert.equal(config.temporalPort, 7233);
+  // The installed stack reaches Temporal over the compose network only
+  // (SPACE_TEMPORAL_ADDRESS: temporal:7233); its service publishes no port,
+  // so the dev stack binding 127.0.0.1:7233 cannot collide with an install.
+  const start = templateCompose.indexOf("\n  temporal:\n");
+  const end = templateCompose.indexOf("\nnetworks:", start);
+  assert.ok(start >= 0 && end > start, "temporal service found in the install template");
+  assert.doesNotMatch(templateCompose.slice(start, end), /\n    ports:/);
 });
 
 test("existing secret files with loose permissions are tightened to 0600", () => {
